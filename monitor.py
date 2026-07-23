@@ -181,8 +181,17 @@ def main():
 
     theatre_id = cfg.get("theatre_id") or state.get("theatre_id")
     if use_api and not theatre_id:
-        theatre_id = resolve_theatre_id(cfg.get("theatre_query", "Metreon"))
-        state["theatre_id"] = theatre_id
+        try:
+            theatre_id = resolve_theatre_id(cfg.get("theatre_query", "Metreon"))
+            state["theatre_id"] = theatre_id
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            if code in (401, 403):
+                print(f"AMC API rejected the key ({code}) — likely not activated "
+                      "yet. Falling back to page scraping for this run.")
+                use_api = False
+            else:
+                raise
 
     # Collect matching showtimes across the date range
     matches = {}
@@ -190,8 +199,18 @@ def main():
     for offset in range(cfg.get("days_ahead", 14) + 1):
         day = today + timedelta(days=offset)
         try:
-            shows = (fetch_showtimes_api(theatre_id, day) if use_api
-                     else fetch_showtimes_scrape(day))
+            try:
+                shows = list(fetch_showtimes_api(theatre_id, day)) if use_api \
+                        else list(fetch_showtimes_scrape(day))
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else 0
+                if use_api and code in (401, 403):
+                    print(f"AMC API rejected the key ({code}) — falling back "
+                          "to page scraping for this run.")
+                    use_api = False
+                    shows = list(fetch_showtimes_scrape(day))
+                else:
+                    raise
             for s in shows:
                 if cfg["movie_match"].lower() not in s["movie"].lower():
                     continue
