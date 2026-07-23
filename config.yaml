@@ -1,0 +1,43 @@
+# ── What to watch ────────────────────────────────────────────────
+# Case-insensitive substring matched against the movie name.
+movie_match: "odyssey"
+
+# ── Where ────────────────────────────────────────────────────────
+# The script resolves the AMC theatre ID automatically from this
+# query on first run and caches it in state.json. If you already
+# know the numeric ID, set theatre_id and the lookup is skipped.
+theatre_query: "Metreon"
+theatre_id: null
+
+# ── When ─────────────────────────────────────────────────────────
+# How many days ahead to scan (today + N).
+days_ahead: 21
+timezone: "America/Los_Angeles"
+
+# Your weekday/time constraints. Only showtimes STARTING inside one
+# of these windows (local time, 24h) count. Omit a day entirely to
+# exclude it. EDIT THESE to your real preferences:
+schedule:
+  mon: ["17:30-19:00"]   # around 6pm
+  tue: []
+  wed: ["17:30-19:00"]   # around 6pm
+  thu: []
+  fri: []
+  sat: ["00:00-21:59"]   # anything except 10pm-or-later starts
+  sun: ["00:00-21:59"]   # anything except 10pm-or-later starts
+
+# ── Format ───────────────────────────────────────────────────────
+# Substrings matched (case-insensitive) against the showtime's
+# attribute codes/names, e.g. "imax", "70mm", "dolby", "laser".
+# A showtime matches if ANY of these hit. Empty list = any format.
+formats_any: ["imax"]
+
+# ── Notifications ────────────────────────────────────────────────
+# available  -> notify when a matching showtime has tickets (not sold out),
+#               including when a previously sold-out show frees up (returns!)
+# almost     -> same, but also warn when a show flips to "almost sold out"
+notify_mode: "available"
+
+# Also send a heads-up if a matching showtime DISAPPEARS or sells out
+# after you were told it was available.
+notify_sold_out: true
