@@ -118,6 +118,7 @@ def fetch_showtimes_api(theatre_id, day: date):
                 "almost": bool(s.get("isAlmostSoldOut")),
                 "canceled": bool(s.get("isCanceled")),
                 "attrs": " | ".join(attrs),
+                "links": s.get("_links", {}),
                 "url": s.get("purchaseUrl")
                        or s.get("_links", {}).get("https://api.amctheatres.com/rels/v2/purchase", {}).get("href")
                        or "https://www.amctheatres.com/movie-theatres/san-francisco/amc-metreon-16/showtimes",
@@ -126,6 +127,144 @@ def fetch_showtimes_api(theatre_id, day: date):
         page_size = body.get("pageSize", 100)
         page += 1
         url = url if page <= -(-total // page_size) else None
+
+
+def _natural_row_key(row):
+    """Sort rows naturally: A < B < ... and 1 < 2 < ... < 10."""
+    row = str(row)
+    return [int(t) if t.isdigit() else t.upper()
+            for t in re.findall(r"\d+|\D+", row)]
+
+
+def count_good_seats(showtime, cfg):
+    """Return (ok, detail_str) for a showtime, or None if unknown.
+
+    Follows the showtime's seat-related hypermedia link, then defensively
+    scans the JSON for seat objects (anything with a row + availability
+    field). 'Good' = available, not in the front N rows, not an excluded
+    seat type. If require_adjacent is set, min_good_seats of them must sit
+    in consecutive columns of the same row. Returns None on any failure so
+    callers can fail open.
+    """
+    sf = cfg.get("seat_filter") or {}
+    min_seats = int(sf.get("min_good_seats", 1))
+    need_adjacent = bool(sf.get("require_adjacent")) and min_seats > 1
+    href = None
+    for rel, v in (showtime.get("links") or {}).items():
+        if "seat" in rel.lower() and isinstance(v, dict) and not v.get("templated"):
+            href = v.get("href")
+            break
+    if not href:
+        return None
+    try:
+        r = requests.get(href, headers=amc_headers(), timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"Seat check failed for showtime {showtime.get('id')}: {e}")
+        return None
+
+    seats = []
+
+    def get_column(seat, low):
+        ck = next((low[k] for k in ("columnname", "column", "col",
+                                    "seatnumber", "number") if k in low), None)
+        val = seat.get(ck) if ck else None
+        if val is None and "name" in low:  # fall back to digits in "C12"
+            m = re.search(r"(\d+)$", str(seat[low["name"]]))
+            val = m.group(1) if m else None
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
+
+    def walk(n):
+        if isinstance(n, dict):
+            low = {k.lower(): k for k in n}
+            rk = next((low[k] for k in ("rowname", "row", "rowlabel") if k in low), None)
+            ak = next((low[k] for k in ("available", "isavailable", "seatstatus",
+                                        "status") if k in low), None)
+            if rk and ak and not isinstance(n[rk], (dict, list)):
+                seats.append((n, n[rk], n[ak], get_column(n, low)))
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+
+    walk(data)
+    if not seats:
+        return None
+
+    rows = sorted({str(r) for _, r, _, _ in seats}, key=_natural_row_key)
+    front = set(rows[:int(sf.get("exclude_front_rows", 2))])
+    bad_types = [t.lower() for t in sf.get("exclude_seat_types", [])]
+
+    def is_available(v):
+        if isinstance(v, bool):
+            return v
+        return str(v).lower() in ("available", "open", "notsold", "true")
+
+    def seat_type_ok(seat):
+        blob = json.dumps(seat).lower()
+        return not any(t in blob for t in bad_types)
+
+    good = [(str(r), c) for seat, r, a, c in seats
+            if is_available(a) and str(r) not in front and seat_type_ok(seat)]
+
+    # Keep only the central portion of each row (aisle/edge seats are meh).
+    band = float(sf.get("center_band", 1.0))
+    if band < 1.0:
+        row_extent = {}
+        for _, r, _, c in seats:
+            if c is not None:
+                lo, hi = row_extent.get(str(r), (c, c))
+                row_extent[str(r)] = (min(lo, c), max(hi, c))
+
+        def in_band(r, c):
+            if c is None or r not in row_extent:
+                return True  # unknown geometry -> fail open
+            lo, hi = row_extent[r]
+            mid, half = (lo + hi) / 2, (hi - lo) * band / 2
+            return mid - half <= c <= mid + half
+
+        good = [(r, c) for r, c in good if in_band(r, c)]
+
+    # Longest run of consecutive columns within each row
+    best_run, best_row = 0, None
+    by_row = {}
+    for r, c in good:
+        by_row.setdefault(r, []).append(c)
+    for r, cols in by_row.items():
+        cols = sorted(c for c in cols if c is not None)
+        run = 1 if cols else 0
+        best_here = run
+        for a, b in zip(cols, cols[1:]):
+            run = run + 1 if b == a + 1 else 1
+            best_here = max(best_here, run)
+        if best_here > best_run:
+            best_run, best_row = best_here, r
+
+    front_edge = rows[:len(front)][-1] if front else "?"
+    if need_adjacent:
+        cols_known = any(c is not None for _, c in good)
+        if not cols_known:
+            # can't verify adjacency — fail open on total count
+            ok = len(good) >= min_seats
+            detail = (f"{len(good)} seat(s) beyond row {front_edge} "
+                      "(adjacency unverified)")
+        else:
+            ok = best_run >= min_seats
+            detail = (f"{best_run} adjacent seat(s) in row {best_row}, "
+                      f"{len(good)} total beyond row {front_edge}"
+                      if ok else
+                      f"only scattered singles beyond row {front_edge}")
+    else:
+        ok = len(good) >= min_seats
+        good_rows = sorted({r for r, _ in good}, key=_natural_row_key)
+        detail = (f"{len(good)} seat(s) beyond row {front_edge}"
+                  + (f" (rows {good_rows[0]}–{good_rows[-1]})" if good_rows else ""))
+    return ok, detail
 
 
 # ── source 2: fallback page scrape (best effort) ─────────────────────────────
@@ -240,12 +379,23 @@ def main():
     known = state.setdefault("showtimes", {})
     msgs = []
 
+    sf = cfg.get("seat_filter") or {}
     for sid, s in sorted(matches.items(), key=lambda kv: kv[1]["dt"]):
         prev = known.get(sid, {})
         status = ("sold_out" if s["sold_out"]
                   else "almost" if s["almost"] else "available")
+        seat_note = ""
+        if status == "available" and use_api and sf.get("enabled"):
+            res = count_good_seats(s, cfg)
+            if res is None:
+                seat_note = "\n   (seat locations unverified)"
+            elif not res[0]:
+                status = "front_only"   # tickets exist but not the seats we want
+            else:
+                seat_note = f"\n   {res[1]}"
         line = (f"{s['dt']:%a %b %-d, %-I:%M %p} — {s['movie']}"
                 + (f"\n   {s['attrs']}" if s["attrs"] else "")
+                + seat_note
                 + f"\n   {s['url']}")
 
         if status == "available" and prev.get("status") != "available":
@@ -255,7 +405,7 @@ def main():
               and prev.get("status") not in ("almost", "sold_out")):
             msgs.append(f"⏳ Almost sold out:\n{line}")
         elif (status == "sold_out" and cfg.get("notify_sold_out")
-              and prev.get("status") == "available"):
+              and prev.get("status") in ("available", "front_only")):
             msgs.append(f"❌ Now sold out:\n{line}")
 
         known[sid] = {"status": status, "when": s["when_local"], "movie": s["movie"]}
