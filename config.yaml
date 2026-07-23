@@ -7,7 +7,7 @@ movie_match: "odyssey"
 # query on first run and caches it in state.json. If you already
 # know the numeric ID, set theatre_id and the lookup is skipped.
 theatre_query: "Metreon"
-theatre_id: null
+theatre_id: 2325
 
 # ── When ─────────────────────────────────────────────────────────
 # How many days ahead to scan (today + N).
